@@ -23,7 +23,7 @@ GitHub PR reviews → download → extract → synthesize → dedupe → place �
 6. **Group** — filter by `min_score` threshold (default 0.5) and organize by topic for progressive disclosure
 7. **Generate** — rephrase rules and write final `AGENTS.md` files
 
-Each stage is resumable — if interrupted, it picks up from where it left off. Pass `--fresh` to any stage or `run` to wipe previous outputs and start clean.
+Each stage is resumable — if interrupted, it picks up from where it left off. Pass `--fresh` to any stage or `run` to wipe previous outputs and start clean. `extract` keeps its existing extractions when the download corpus only grew (e.g. re-running after a resumed/rate-limited download); it starts from scratch only when previously extracted comments are no longer present.
 
 ## Example
 
@@ -114,13 +114,14 @@ All stages support `--concurrency N` to control parallel LLM/API requests and `-
 ### `run` — Full pipeline
 
 ```bash
-uv run braindump --repo owner/repo run [--from STAGE] [--skip STAGE ...] [--since DATE] [--authors USER] [--min-score 0.5] [--max-rules N] [--fresh]
+uv run braindump --repo owner/repo run [--from STAGE] [--skip STAGE ...] [--since DATE] [--authors USER] [--resources LIST] [--min-score 0.5] [--max-rules N] [--fresh]
 ```
 
 - `--from`: Start from a specific stage (e.g. `--from synthesize`)
 - `--skip`: Skip stages (repeatable, e.g. `--skip download --skip extract`)
 - `--since`: Date filter for download (YYYY-MM-DD)
 - `--authors`: Author filter for extract (default: `all`)
+- `--resources`: Per-PR data to download (default: `all`; see `download` below)
 - `--min-score`: Override rule score threshold (default: 0.5)
 - `--max-rules N`: Cap the number of rules in group stage (top-scored)
 - `--fresh`: Wipe all stage outputs and start from scratch
@@ -128,8 +129,12 @@ uv run braindump --repo owner/repo run [--from STAGE] [--skip STAGE ...] [--sinc
 ### `download` — Fetch PR data
 
 ```bash
-uv run braindump --repo owner/repo download [--since YYYY-MM-DD] [--concurrency 5]
+uv run braindump --repo owner/repo download [--since YYYY-MM-DD] [--resources LIST] [--concurrency 5]
 ```
+
+`--resources` selects which per-PR data to fetch: `prs,reviews,review_comments,diffs,issue_comments` (default: `all`). Only `review_comments` is read by later stages, so large-repo runs can fetch `--resources review_comments` and cut API calls by 5x.
+
+Downloading is bounded by GitHub's API: the search API (used for the PR list) returns at most 1000 results per query, so wide date ranges are split into date chunks automatically, and the authenticated rate limit is 5000 requests/hour, so a large range needs several passes. The download stage resumes — re-run the same command to fill in whatever the rate limit cut short.
 
 ### `extract` — Extract rules from comments
 
@@ -146,6 +151,11 @@ uv run braindump --repo owner/repo extract [--authors USER] [--limit N] [--rando
 ```bash
 uv run braindump --repo owner/repo synthesize [--similarity-threshold 0.65] [--min-cluster-size 3] [--concurrency 10]
 ```
+
+Clustering holds the pairwise cosine similarities of every generalization as a quantized int16
+matrix (2 bytes per pair, ~5.9 GB at 55k items). Above 1 GiB the matrix is memory-mapped to an
+unlinked scratch file in the stage directory instead of being resident, so large corpora do not
+need the matrix's worth of RAM free.
 
 ### `dedupe` — Deduplicate similar rules
 
@@ -254,6 +264,13 @@ Model strings follow the [pydantic-ai format](https://ai.pydantic.dev/models/): 
 - `openai:text-embedding-3-small` (direct OpenAI)
 
 When using `gateway/...` models, set `PYDANTIC_AI_GATEWAY_API_KEY`. For direct providers, set the provider-specific key (e.g. `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`).
+
+### OpenAI-compatible provider settings
+
+Two environment variables adapt the `openai:`/`openai-chat:` model path for endpoints that deviate from OpenAI's API:
+
+- `BRAINDUMP_OPENAI_COMPAT_QUIRKS=1` — use native JSON-schema structured output (`response_format`) instead of pydantic-ai's default `tool_choice="required"` output mode, which some providers reject (e.g. Neuralwatt returns 502 for `deepseek` models), and tolerate non-conformant response fields (e.g. `service_tier: "standard"`).
+- `BRAINDUMP_REASONING_EFFORT=none|minimal|low|medium|high|xhigh` — set the reasoning effort sent with every request. pydantic-ai sends none by default, so providers apply their own default, typically their highest level; reasoning can dominate output tokens and latency (measured on a 62-rule `generate` run: 20x faster and 3.5x fewer completion tokens at `none`, with slightly fewer project-specific references preserved).
 
 ## Observability
 

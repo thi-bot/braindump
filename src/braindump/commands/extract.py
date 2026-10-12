@@ -208,20 +208,25 @@ def load_comments(review_dir: Path) -> list[dict]:
     return all_comments
 
 
+def comment_user(comment: dict) -> dict:
+    """The comment's author, as an empty dict for deleted accounts (`user: null` in the API)."""
+    return comment.get("user") or {}
+
+
 def filter_bots(comments: list[dict]) -> list[dict]:
     """Exclude comments from bot accounts."""
     return [
         c
         for c in comments
-        if c.get("user", {}).get("type") != "Bot"
-        and not c.get("user", {}).get("login", "").endswith("[bot]")
+        if comment_user(c).get("type") != "Bot"
+        and not comment_user(c).get("login", "").endswith("[bot]")
     ]
 
 
 def filter_by_author(comments: list[dict], author: str | None) -> list[dict]:
     if author is None:
         return comments
-    return [c for c in comments if c.get("user", {}).get("login") == author]
+    return [c for c in comments if comment_user(c).get("login") == author]
 
 
 def build_thread_map(comments: list[dict]) -> dict[int, list[dict]]:
@@ -248,7 +253,7 @@ def format_thread_context(thread: list[dict]) -> str:
         return "No prior thread context."
     parts = []
     for i, comment in enumerate(thread):
-        user = comment.get("user", {}).get("login", "unknown")
+        user = comment_user(comment).get("login", "unknown")
         body = comment.get("body", "")
         parts.append(f"[{i + 1}] @{user}: {body}")
     return "\n".join(parts)
@@ -290,6 +295,26 @@ def load_checkpoint(checkpoint_path: Path) -> set[int]:
             data = json.load(f)
             return set(data.get("processed_ids", []))
     return set()
+
+
+def corpus_contains_processed(review_dir: Path, processed_ids: set[int]) -> bool:
+    """Check whether every previously processed comment still exists in the corpus.
+
+    The download stage resumes across rate-limit windows, so the comment corpus only grows while
+    an extract is running; in that case prior extractions stay valid and must be kept (the
+    checkpoint skips them). If comments disappeared, the extractions hold stale data and the
+    caller drops them.
+    """
+    remaining = set(processed_ids)
+    if not remaining:
+        return True
+    for filepath in sorted(review_dir.glob("*.json")):
+        with open(filepath) as f:
+            for comment in json.load(f):
+                remaining.discard(comment["id"])
+        if not remaining:
+            return True
+    return False
 
 
 def save_checkpoint(checkpoint_path: Path, processed_ids: set[int]):
@@ -401,7 +426,7 @@ async def process_all(
                     num_rules=len(result.potential_rules) if result.is_actionable else 0,
                     rejection_reason=result.rejection.reason if result.rejection else None,
                 )
-                author = comment.get("user", {}).get("login", "unknown")
+                author = comment_user(comment).get("login", "unknown")
                 output = ExtractionOutput(
                     comment_id=comment_id,
                     pr_number=pr_number,
@@ -428,6 +453,10 @@ async def process_all(
                     pr_number=pr_number,
                     error=str(e),
                 )
+                if not is_pipeline:
+                    console.print(
+                        f"[yellow]Failed comment {comment_id} (PR #{pr_number}): {e}[/yellow]"
+                    )
                 return comment, None, str(e), Decimal(0)
 
     batch_size = concurrency * 2
@@ -503,7 +532,20 @@ def _run(
         elif output_dir.exists() and hash_path.exists():
             stored_hash = hash_path.read_text().strip()
             if stored_hash != input_hash:
-                shutil.rmtree(output_dir)
+                processed_ids = load_checkpoint(output_dir / "checkpoint.json")
+                if corpus_contains_processed(review_dir, processed_ids):
+                    logfire.info(
+                        "Download data changed but every processed comment is still present; "
+                        "keeping prior extractions",
+                        processed=len(processed_ids),
+                    )
+                    if not is_pipeline:
+                        console.print(
+                            f"Download data changed; resuming ({len(processed_ids)} comments "
+                            "already extracted)"
+                        )
+                else:
+                    shutil.rmtree(output_dir)
 
         output_dir.mkdir(parents=True, exist_ok=True)
         hash_path.write_text(input_hash)
@@ -568,13 +610,17 @@ def _run(
         actionable = int(stats.get("actionable", 0))
         rejected = int(stats.get("rejected", 0))
         rules = int(stats.get("rules", 0))
-        stats.detail = f"{comments} comments \u2192 {actionable} actionable, {rejected} rejected \u2192 {rules} generalizations"
+        errors = int(stats.get("errors", 0))
+        detail = f"{comments} comments \u2192 {actionable} actionable, {rejected} rejected"
+        if errors:
+            detail += f", [yellow]{errors} errors[/yellow]"
+        stats.detail = detail + f" \u2192 {rules} generalizations"
         return stats
 
 
 def extract(
     ctx: typer.Context,
-    authors: str = typer.Option("all", help="Filter to specific author, or 'all'"),
+    authors: str | None = typer.Option(None, help="Filter to specific author, or 'all'"),
     limit: int | None = typer.Option(None, help="Limit number of comments to process"),
     random_sample: bool = typer.Option(False, "--random", help="Randomly sample comments"),
     seed: int = typer.Option(42, help="Random seed for reproducible sampling"),
@@ -585,9 +631,9 @@ def extract(
     """Extract potential rules from review comments."""
     config: RepoConfig = ctx.obj["config"]
 
-    if authors == "all":
+    if authors is None:
         prompted = typer.prompt("Filter to author login (or 'all' for everyone)", default="all")
-        authors = prompted
+        authors = str(prompted)
 
     _run(
         config,

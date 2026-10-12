@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 from collections import defaultdict
 from decimal import Decimal
@@ -16,7 +17,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from rich.progress import Progress, TaskID
 
-from braindump.config import RepoConfig, compute_file_hash
+from braindump.config import RepoConfig, compute_file_hash, run_agent_with_retry
 from braindump.progress import StageStats, console, format_cost, get_result_cost, stage_progress
 
 # ============================================================================
@@ -55,6 +56,8 @@ def get_rephrase_agent() -> Agent[None, RephrasedRule]:
                 5. Preserves project-specific references — class names, file paths, directory conventions,
                    config patterns. These are the most valuable parts of a rule for an AGENTS.md.
                    Don't strip them for brevity.
+                6. The rationale explains why the rule matters in the codebase — the bug, incompatibility,
+                   or inconsistency it prevents. Write it for a reader who only ever sees the final text.
 
                 Use backticks for all code identifiers, file paths, class names, function names,
                 parameter names, etc. — this is markdown and should be formatted accordingly.
@@ -118,7 +121,7 @@ Placement rationale: {placement["placement"].get("rationale", "N/A")[:500]}
 Example of bad code: {rule.get("example_bad", "N/A")}
 Example of good code: {rule.get("example_good", "N/A")}
     """.strip()
-    result = await get_rephrase_agent().run(context)
+    result = await run_agent_with_retry(get_rephrase_agent(), context)
     return result.output, get_result_cost(result)
 
 
@@ -189,6 +192,14 @@ async def rephrase_rules_batch(
                     return None
                 placement = placements.get(rid, {"placement": {}})
                 result, cost = await rephrase_rule(rule, placement)
+                if not result.rule_text.strip():
+                    # The model occasionally returns an empty text as a valid-looking reply (8 of
+                    # 2,303 on the django/django run, in both that run and the Wagtail one). Retry
+                    # once, then keep the original rule text so the bullet can never render blank.
+                    result, retry_cost = await rephrase_rule(rule, placement)
+                    cost += retry_cost
+                    if not result.rule_text.strip():
+                        result = RephrasedRule(rule_text=rule["text"], rationale=result.rationale)
                 if stats:
                     stats.add_cost(cost)
                 if cache_path:
@@ -224,8 +235,25 @@ def sort_by_signal(rule_ids: list[int], placements: dict[int, dict]) -> list[int
     )
 
 
+_LEADING_BULLET_RE = re.compile(r"^(?:[-*+]\s+|\d+[.)]\s+)")
+
+
 def format_rule_line(rule_id: int, rephrased: RephrasedRule) -> str:
-    return f"<!-- rule:{rule_id} -->\n- {rephrased.rule_text} — {rephrased.rationale}"
+    """Render one rule as a top-level bullet, nesting any embedded list under it.
+
+    Consolidation/rephrase output is sometimes a multi-line bullet list; emitting it verbatim
+    after "- " produced "- - ..." and promoted its sub-points to top-level bullets (breaking the
+    file's list structure), so strip a leading marker and indent continuation lines.
+    """
+    text_lines = [
+        line for line in (line.rstrip() for line in rephrased.rule_text.split("\n")) if line.strip()
+    ]
+    if not text_lines:
+        return f"<!-- rule:{rule_id} -->\n- {rephrased.rationale.strip()}"
+    first = _LEADING_BULLET_RE.sub("", text_lines[0].strip())
+    lines = [f"- {first} — {rephrased.rationale.strip()}"]
+    lines.extend(f"  {line}" for line in text_lines[1:])
+    return f"<!-- rule:{rule_id} -->\n" + "\n".join(lines)
 
 
 CATEGORY_NAMES = {
@@ -415,6 +443,24 @@ async def generate_all_files(
         )
 
     file_rules_by_dir: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    known_dirs = {
+        loc_data["location"]
+        for loc_data in organization["locations"]
+        if not loc_data["location"].startswith("file:")
+    }
+
+    def render_target(dir_path: str) -> str:
+        # Rolled-up directories are absent from `locations`, which would orphan the file-level rules
+        # of any file inside them (176 of 405 file placements on this run never rendered anywhere).
+        # Attach them to the nearest ancestor that does render; nothing above the root to fall back on.
+        parts = dir_path.rstrip("/").split("/")
+        while parts:
+            candidate = "/".join(parts)
+            if candidate in known_dirs:
+                return candidate
+            parts = parts[:-1]
+        return "root"
+
     for loc_data in organization["locations"]:
         location = loc_data["location"]
         if location.startswith("file:"):
@@ -424,7 +470,7 @@ async def generate_all_files(
                 dir_path = "root"
             rule_ids = loc_data.get("inline_rules", [])
             if rule_ids:
-                file_rules_by_dir[dir_path][file_path] = rule_ids
+                file_rules_by_dir[render_target(dir_path)][file_path] = rule_ids
 
     all_dir_locations = [
         loc_data["location"]

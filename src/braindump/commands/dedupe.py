@@ -15,7 +15,7 @@ from pydantic_ai import Agent, Embedder
 from rich.progress import Progress, TaskID
 
 from braindump.commands.synthesize import calculate_rule_score
-from braindump.config import RepoConfig, compute_file_hash
+from braindump.config import RepoConfig, compute_file_hash, run_agent_with_retry
 from braindump.progress import StageStats, console, format_cost, get_result_cost, stage_progress
 
 # ============================================================================
@@ -149,17 +149,6 @@ def get_embedder() -> Embedder:
 
 
 # ============================================================================
-# Utility Functions
-# ============================================================================
-
-
-def cosine_similarity(a: list[float], b: list[float]) -> float:
-    a_arr = np.array(a)
-    b_arr = np.array(b)
-    return float(np.dot(a_arr, b_arr) / (np.linalg.norm(a_arr) * np.linalg.norm(b_arr)))
-
-
-# ============================================================================
 # Data Loading
 # ============================================================================
 
@@ -216,10 +205,10 @@ async def build_rule_embeddings(
     rules: list[dict],
     progress: Progress | None = None,
     task_id: TaskID | None = None,
-) -> list[list[float]]:
+) -> np.ndarray:
     texts = [rule["text"] for rule in rules]
     logfire.info("Generating rule embeddings", total=len(texts))
-    all_embeddings = []
+    all_embeddings: list[np.ndarray] = []
     batch_size = 100
     if progress and task_id is not None:
         progress.update(task_id, total=len(texts), description="Embedding rules...")
@@ -229,20 +218,25 @@ async def build_rule_embeddings(
             "embed batch: {batch_num}", batch_num=i // batch_size + 1, batch_size=len(batch)
         ):
             result = await get_embedder().embed_documents(batch)
-            all_embeddings.extend([list(e) for e in result.embeddings])
+            all_embeddings.extend(np.asarray(e, dtype=np.float32) for e in result.embeddings)
         if progress and task_id is not None:
             progress.update(task_id, completed=min(i + batch_size, len(texts)))
     logfire.info("Rule embeddings complete")
-    return all_embeddings
+    return np.stack(all_embeddings)
 
 
 @logfire.instrument("find similar clusters")
 def find_similar_clusters(
-    rules: list[dict],
-    embeddings: list[list[float]],
+    embeddings: np.ndarray,
     similarity_threshold: float = 0.75,
+    chunk_size: int = 1024,
 ) -> list[list[int]]:
-    n = len(rules)
+    """Union rules connected by a pair at or above the similarity threshold.
+
+    The similarity matrix is n^2; evaluating it in row chunks keeps memory at
+    chunk_size * n floats, and only pairs above the threshold reach the union-find.
+    """
+    n = embeddings.shape[0]
     parent = list(range(n))
     rank = [0] * n
 
@@ -262,11 +256,17 @@ def find_similar_clusters(
         if rank[rx] == rank[ry]:
             rank[rx] += 1
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            sim = cosine_similarity(embeddings[i], embeddings[j])
-            if sim >= similarity_threshold:
-                union(i, j)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    normalized = embeddings / norms
+
+    for start in range(0, n, chunk_size):
+        stop = min(start + chunk_size, n)
+        sims = normalized[start:stop] @ normalized.T
+        idx_i, idx_j = np.nonzero(sims >= similarity_threshold)
+        above = (start + idx_i) < idx_j
+        for i, j in zip((start + idx_i[above]).tolist(), idx_j[above].tolist(), strict=True):
+            union(i, j)
 
     clusters_map: dict[int, list[int]] = {}
     for i in range(n):
@@ -419,7 +419,7 @@ async def consolidate_cluster(cluster_rules: list[dict]) -> tuple[list[dict], De
 
 Produce the minimal set of distinct rules that covers all the guidance above.
 """
-    result = await get_consolidate_agent().run(prompt)
+    result = await run_agent_with_retry(get_consolidate_agent(), prompt)
     return _build_output_rules(result.output, cluster_rules), get_result_cost(result)
 
 
@@ -454,9 +454,9 @@ Return only groups of 2+ duplicate rules. Rules not in any group are unique and 
 """
     if semaphore:
         async with semaphore:
-            result = await get_category_review_agent().run(prompt)
+            result = await run_agent_with_retry(get_category_review_agent(), prompt)
     else:
-        result = await get_category_review_agent().run(prompt)
+        result = await run_agent_with_retry(get_category_review_agent(), prompt)
     total_cost = get_result_cost(result)
     duplicate_groups = result.output.duplicate_groups
 
@@ -556,14 +556,14 @@ Return only groups of 2+ duplicate rules. Rules not in any group are unique and 
 
 async def deduplicate_rules(
     rules: list[dict],
-    embeddings: list[list[float]],
+    embeddings: np.ndarray,
     similarity_threshold: float = 0.75,
     concurrency: int = 10,
     progress: Progress | None = None,
     task_id: TaskID | None = None,
     stats: StageStats | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    clusters = find_similar_clusters(rules, embeddings, similarity_threshold)
+    clusters = find_similar_clusters(embeddings, similarity_threshold)
     multi_clusters = [c for c in clusters if len(c) > 1]
 
     semaphore = asyncio.Semaphore(concurrency)
@@ -595,7 +595,18 @@ async def deduplicate_rules(
         async def consolidate_pass1(cluster_indices: list[int]) -> None:
             cluster_rules = [rules[i] for i in cluster_indices]
             async with semaphore:
-                output_rules, cost = await consolidate_cluster(cluster_rules)
+                try:
+                    output_rules, cost = await consolidate_cluster(cluster_rules)
+                except Exception as exc:  # keep the stage alive: leave the cluster unconsolidated
+                    logfire.warn(
+                        "cluster consolidation failed; keeping rules unconsolidated",
+                        cluster_size=len(cluster_rules),
+                        error=str(exc)[:200],
+                    )
+                    output_rules = [r.copy() for r in cluster_rules]
+                    cost = Decimal(0)
+                    if stats:
+                        stats.inc("errors")
             async with write_lock:
                 if stats:
                     stats.add_cost(cost)
@@ -657,9 +668,19 @@ async def deduplicate_rules(
 
         async def review_one_category(cat: str) -> None:
             cat_rules = cats_to_review[cat]
-            output_rules, log_entries, cost = await category_review(
-                cat, cat_rules, semaphore=semaphore
-            )
+            try:
+                output_rules, log_entries, cost = await category_review(
+                    cat, cat_rules, semaphore=semaphore
+                )
+            except Exception as exc:  # keep the stage alive: leave the category unreviewed
+                logfire.warn(
+                    "category review failed; keeping rules as-is",
+                    category=cat,
+                    error=str(exc)[:200],
+                )
+                output_rules, log_entries, cost = cat_rules, [], Decimal(0)
+                if stats:
+                    stats.inc("errors")
             async with write_lock:
                 if stats:
                     stats.add_cost(cost)
@@ -719,9 +740,19 @@ async def deduplicate_rules(
 
             async def recheck_one_category(cat: str) -> None:
                 cat_rules = cats_to_recheck[cat]
-                output_rules, log_entries, cost = await category_review(
-                    cat, cat_rules, semaphore=semaphore
-                )
+                try:
+                    output_rules, log_entries, cost = await category_review(
+                        cat, cat_rules, semaphore=semaphore
+                    )
+                except Exception as exc:  # keep the stage alive: leave the category unreviewed
+                    logfire.warn(
+                        "post-consolidation review failed; keeping rules as-is",
+                        category=cat,
+                        error=str(exc)[:200],
+                    )
+                    output_rules, log_entries, cost = cat_rules, [], Decimal(0)
+                    if stats:
+                        stats.inc("errors")
                 async with write_lock:
                     if stats:
                         stats.add_cost(cost)
@@ -765,15 +796,17 @@ DEDUPE_FILES = [
 ]
 
 
-def _save_embeddings(rules: list[dict], embeddings: list[list[float]], output_dir: Path) -> None:
+def _save_embeddings(rules: list[dict], embeddings: np.ndarray, output_dir: Path) -> None:
     """Save embeddings and keys to disk for resume."""
     keys = [rule["text"] for rule in rules]
-    np.savez_compressed(output_dir / "embeddings.npz", embeddings=np.array(embeddings))
+    np.savez_compressed(
+        output_dir / "embeddings.npz", embeddings=np.asarray(embeddings, dtype=np.float32)
+    )
     with open(output_dir / "embeddings_keys.json", "w") as f:
         json.dump(keys, f)
 
 
-def _load_embeddings(rules: list[dict], output_dir: Path) -> list[list[float]] | None:
+def _load_embeddings(rules: list[dict], output_dir: Path) -> np.ndarray | None:
     """Load cached embeddings if keys match. Returns embeddings or None."""
     npz_path = output_dir / "embeddings.npz"
     keys_path = output_dir / "embeddings_keys.json"
@@ -785,10 +818,10 @@ def _load_embeddings(rules: list[dict], output_dir: Path) -> list[list[float]] |
     if cached_keys != current_keys:
         return None
     data = np.load(npz_path)
-    embeddings = data["embeddings"]
+    embeddings = data["embeddings"].astype(np.float32, copy=False)
     if len(embeddings) != len(rules):
         return None
-    return [list(e) for e in embeddings]
+    return embeddings
 
 
 async def _async_run(
@@ -917,7 +950,11 @@ async def _async_run(
         input_count = int(stats.get("input_rules", 0))
         output_count = int(stats.get("output_rules", 0))
         merged_count = int(stats.get("merged", 0))
-        stats.detail = f"{input_count} \u2192 {output_count} rules ({merged_count} merged)"
+        errors = int(stats.get("errors", 0))
+        detail = f"{input_count} \u2192 {output_count} rules ({merged_count} merged)"
+        if errors:
+            detail += f", [yellow]{errors} errors[/yellow]"
+        stats.detail = detail
         return stats
 
 

@@ -146,7 +146,7 @@ def _lookup_rule(rule_id: int, data_dir: Path, verbose: bool = False) -> None:
         for i, cid in enumerate(source_comment_ids[:5]):
             if cid in comments:
                 c = comments[cid]
-                user = c.get("user", {}).get("login", "?")
+                user = (c.get("user") or {}).get("login", "?")
                 print(f"\n[{i + 1}] PR #{c.get('pr_number', '?')} by @{user}")
                 path = c.get("path", "")
                 if path:

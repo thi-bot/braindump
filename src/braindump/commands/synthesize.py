@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tempfile
+import time
 from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
@@ -16,7 +19,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, Embedder
 from rich.progress import Progress, TaskID
 
-from braindump.config import RepoConfig, compute_file_hash
+from braindump.config import RepoConfig, compute_file_hash, run_agent_with_retry
 from braindump.progress import StageStats, console, format_cost, get_result_cost, stage_progress
 
 # ============================================================================
@@ -216,7 +219,7 @@ class GeneralizationItem:
         self.pr_number = pr_number
         self.source_change_index = source_change_index
         self.source_context = source_context
-        self.embedding: list[float] | None = None
+        self.embedding: np.ndarray | None = None
 
 
 # ============================================================================
@@ -276,7 +279,9 @@ def extract_generalizations(extractions: list[dict]) -> list[GeneralizationItem]
 def _save_embeddings_cache(items: list[GeneralizationItem], output_dir: Path) -> None:
     """Save embeddings and their keys to disk for resume."""
     keys = [item.generalization for item in items]
-    embeddings = np.array([item.embedding for item in items if item.embedding is not None])
+    embeddings = np.array(
+        [item.embedding for item in items if item.embedding is not None], dtype=np.float32
+    )
     np.savez_compressed(output_dir / "embeddings.npz", embeddings=embeddings)
     with open(output_dir / "embeddings_keys.json", "w") as f:
         json.dump(keys, f)
@@ -294,11 +299,11 @@ def _load_embeddings_cache(items: list[GeneralizationItem], output_dir: Path) ->
     if cached_keys != current_keys:
         return False
     data = np.load(npz_path)
-    embeddings = data["embeddings"]
+    embeddings = data["embeddings"].astype(np.float32, copy=False)
     if len(embeddings) != len(items):
         return False
     for item, emb in zip(items, embeddings, strict=True):
-        item.embedding = list(emb)
+        item.embedding = emb
     return True
 
 
@@ -329,32 +334,163 @@ async def build_embeddings(
         if progress and task_id is not None:
             progress.update(task_id, completed=min(i + batch_size, len(texts)))
     for item, emb in zip(items, all_embeddings, strict=True):
-        item.embedding = list(emb)
+        item.embedding = np.asarray(emb, dtype=np.float32)
     logfire.info("Embeddings complete")
 
 
-def cosine_similarity(a: list[float], b: list[float]) -> float:
-    a_arr = np.array(a)
-    b_arr = np.array(b)
-    return float(np.dot(a_arr, b_arr) / (np.linalg.norm(a_arr) * np.linalg.norm(b_arr)))
+def _take_normalized_embeddings(
+    items: list[GeneralizationItem], valid_indices: list[int]
+) -> np.ndarray:
+    """Stack the embeddings of the valid items into an L2-normalized float32 matrix.
 
-
-def _build_similarity_matrix(items: list[GeneralizationItem]) -> tuple[np.ndarray, list[int]]:
-    """Build pairwise cosine similarity matrix for items with embeddings."""
-    valid_indices = [i for i, item in enumerate(items) if item.embedding is not None]
-    n = len(valid_indices)
-    if n == 0:
-        return np.array([]), valid_indices
-
-    # Stack embeddings into a matrix and normalize rows
-    embeddings = np.array([items[i].embedding for i in valid_indices])
+    The per-item rows are cleared: the stacked matrix is the only copy the clustering needs,
+    and keeping both would double the resident size of the corpus.
+    """
+    rows = [items[i].embedding for i in valid_indices]
+    embeddings = np.stack([row for row in rows if row is not None]).astype(np.float32, copy=False)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms[norms == 0] = 1  # avoid division by zero
-    normalized = embeddings / norms
+    embeddings /= norms
+    for index in valid_indices:
+        items[index].embedding = None
+    return embeddings
 
-    # Cosine similarity = dot product of normalized vectors
-    sim_matrix = normalized @ normalized.T
-    return sim_matrix, valid_indices
+
+# Cluster-to-cluster averages are stored quantized to int16 (resolution 1/30000 ≈ 3e-5) so the
+# pairwise matrix costs 2 bytes per entry: at n=54522 that is 5.9 GB, where the float32 matrix
+# would be 11.9 GB and Python dict of pair sums above 20 GB.
+_AVG_SCALE = 30000
+
+
+def _quantize(averages: np.ndarray) -> np.ndarray:
+    """Quantize cosine averages in [-1, 1] to int16 storage."""
+    return np.clip(np.rint(averages * _AVG_SCALE), -32767, 32767).astype(np.int16)
+
+
+def _dequantize(quantized: np.ndarray) -> np.ndarray:
+    return quantized.astype(np.float32) / _AVG_SCALE
+
+
+def _allocate_pair_matrix(n: int, scratch_dir: Path | None) -> np.ndarray:
+    """Allocate the int16 pair matrix in RAM, falling back to a scratch file.
+
+    Resident memory is the right default even at 5.9 GB (n=54522): the merge loop rewrites one row
+    and one column per merge, and a column of a row-major matrix touches every page of it. A
+    file-backed mapping turns that into writeback-plus-reread of the whole file per merge; measured
+    175 GB of writes in 45 minutes, with no sign of finishing. Keep the scratch file only for the
+    case where 2*n^2 bytes genuinely does not fit in RAM. It is unlinked straight away, so it
+    disappears with the mapping and never shows up in the data directory.
+    """
+    try:
+        return np.zeros((n, n), dtype=np.int16)
+    except MemoryError:
+        if scratch_dir is None:
+            raise
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    handle, path = tempfile.mkstemp(prefix="clustering-", suffix=".int16", dir=scratch_dir)
+    os.unlink(path)
+    return np.memmap(os.fdopen(handle, "r+b"), dtype=np.int16, mode="r+", shape=(n, n))
+
+
+def _pairwise_similarities(
+    embeddings: np.ndarray, scratch_dir: Path | None, chunk_size: int = 1024
+) -> np.ndarray:
+    """Quantized cosine similarity matrix, filled in row chunks to bound peak memory."""
+    n = embeddings.shape[0]
+    matrix = _allocate_pair_matrix(n, scratch_dir)
+    for start in range(0, n, chunk_size):
+        stop = min(start + chunk_size, n)
+        matrix[start:stop] = _quantize(embeddings[start:stop] @ embeddings.T)
+    return matrix
+
+
+def _cluster_matrix(
+    embeddings: np.ndarray, similarity_threshold: float, scratch_dir: Path | None = None
+) -> list[list[int]]:
+    """Greedy average-linkage clustering, merging the most similar pair of clusters first.
+
+    Merging two clusters replaces the averages of both with their size-weighted mean, so every
+    cluster's best remaining pair gets worse monotonically over the run. Selection of the
+    globally most similar pair therefore needs one cached upper bound per cluster rather than a
+    heap of pair entries (n^2 of them, which does not fit memory at this corpus size), and
+    merging the pair into the lower-numbered cluster keeps both matrix rows contiguous.
+    """
+    import heapq
+
+    n = embeddings.shape[0]
+    if n < 2:
+        return [[i] for i in range(n)]
+
+    matrix = _pairwise_similarities(embeddings, scratch_dir)
+    logfire.info(
+        "Pair matrix allocated",
+        items=n,
+        file_backed=isinstance(matrix, np.memmap),
+    )
+    live = np.ones(n, dtype=bool)
+    # Cached upper bound per cluster on its best pair's average; recomputed on pop, and exact
+    # whenever it matches what the cluster last computed (matrix rows only ever get worse).
+    row_best = np.ones(n, dtype=np.float32)
+    cluster_size: dict[int, int] = {i: 1 for i in range(n)}
+    cluster_members: dict[int, list[int]] = {i: [i] for i in range(n)}
+
+    def best_pair(ca: int) -> tuple[int, float]:
+        """Most similar live partner of ca and their average, from ca's matrix row."""
+        row = np.where(live, matrix[ca], np.int16(-32767))
+        row[ca] = -32767
+        cb = int(np.argmax(row))
+        return cb, float(row[cb]) / _AVG_SCALE
+
+    heap = [(-1.0, i) for i in range(n)]
+    heapq.heapify(heap)
+
+    merges = 0
+    merge_start = time.monotonic()
+    while heap and -heap[0][0] >= similarity_threshold:
+        neg_avg, ca = heapq.heappop(heap)
+        if not live[ca] or -neg_avg != row_best[ca]:
+            continue
+        cb, avg = best_pair(ca)
+        if avg < row_best[ca]:
+            # The cached bound was stale; re-queue the corrected value and keep looking for the
+            # pair that is genuinely most similar, so merges still happen in descending order.
+            row_best[ca] = avg
+            if avg >= similarity_threshold:
+                heapq.heappush(heap, (-avg, ca))
+            continue
+
+        head, dead = (ca, cb) if ca < cb else (cb, ca)
+        size_head, size_dead = cluster_size[head], cluster_size[dead]
+        merged = (size_head * _dequantize(matrix[head]) + size_dead * _dequantize(matrix[dead])) / (
+            size_head + size_dead
+        )
+        row = _quantize(merged)
+        matrix[head] = row
+        matrix[:, head] = row
+
+        live[dead] = False
+        cluster_size[head] = size_head + size_dead
+        cluster_members[head].extend(cluster_members.pop(dead))
+        row_best[head], _ = best_pair(head)
+        heapq.heappush(heap, (-row_best[head], head))
+
+        merges += 1
+        if merges % 1000 == 0:
+            elapsed = time.monotonic() - merge_start
+            logfire.info(
+                "Clustering merges",
+                merges=merges,
+                live_clusters=int(live.sum()),
+                rate_per_s=round(merges / elapsed, 1),
+            )
+
+    logfire.info(
+        "Clustering complete",
+        clusters=int(live.sum()),
+        merges=merges,
+        seconds=round(time.monotonic() - merge_start, 1),
+    )
+    return list(cluster_members.values())
 
 
 @logfire.instrument("cluster generalizations")
@@ -362,15 +498,13 @@ def cluster_generalizations(
     items: list[GeneralizationItem],
     similarity_threshold: float = 0.65,
     min_cluster_size: int = 2,
+    scratch_dir: Path | None = None,
 ) -> list[list[GeneralizationItem]]:
-    """Agglomerative clustering with average-linkage.
+    """Greedy average-linkage clustering of every pair at or above similarity_threshold.
 
-    Builds a full similarity matrix, then iteratively merges the two most
-    similar clusters until no pair exceeds the threshold. Uses a heap with
-    lazy deletion for efficiency on large inputs.
+    `scratch_dir` hosts the file-backed pair matrix above roughly 23000 items; without it the
+    matrix is allocated in memory.
     """
-    import heapq
-
     logfire.info(
         "Clustering generalizations",
         num_items=len(items),
@@ -378,78 +512,19 @@ def cluster_generalizations(
         min_size=min_cluster_size,
     )
 
-    sim_matrix, valid_indices = _build_similarity_matrix(items)
-    n = len(valid_indices)
-    if n == 0:
+    valid_indices = [i for i, item in enumerate(items) if item.embedding is not None]
+    if not valid_indices:
         return []
+    embeddings = _take_normalized_embeddings(items, valid_indices)
 
-    # Initialize: each valid item is its own cluster
-    cluster_size: dict[int, int] = {i: 1 for i in range(n)}
-    cluster_members: dict[int, list[int]] = {i: [i] for i in range(n)}
-
-    # Cache of sum-of-similarities between cluster pairs
-    # Average-linkage = sim_sums[key] / (size_a * size_b)
-    sim_sums: dict[tuple[int, int], float] = {}
-
-    # Max-heap using negative similarity (heapq is a min-heap)
-    # Entries: (-avg_sim, ca, cb, size_a_when_pushed, size_b_when_pushed)
-    # Stale entries are detected by checking if sizes still match
-    heap: list[tuple[float, int, int, int, int]] = []
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            s = float(sim_matrix[i, j])
-            sim_sums[(i, j)] = s
-            if s >= similarity_threshold:
-                heapq.heappush(heap, (-s, i, j, 1, 1))
-
-    while heap:
-        neg_sim, ca, cb, size_a_snap, size_b_snap = heapq.heappop(heap)
-
-        # Skip stale entries (cluster was merged or sizes changed)
-        if ca not in cluster_size or cb not in cluster_size:
-            continue
-        if cluster_size[ca] != size_a_snap or cluster_size[cb] != size_b_snap:
-            continue
-
-        avg_sim = -neg_sim
-        if avg_sim < similarity_threshold:
-            break
-
-        # Merge cb into ca
-        new_size = cluster_size[ca] + cluster_size[cb]
-
-        # Update sim_sums and push new heap entries for all other clusters
-        for cc in list(cluster_size):
-            if cc in (ca, cb):
-                continue
-            key_a = (min(ca, cc), max(ca, cc))
-            key_b = (min(cb, cc), max(cb, cc))
-            new_sum = sim_sums.pop(key_a, 0.0) + sim_sums.pop(key_b, 0.0)
-            new_key = (min(ca, cc), max(ca, cc))
-            sim_sums[new_key] = new_sum
-            new_avg = new_sum / (new_size * cluster_size[cc])
-            if new_avg >= similarity_threshold:
-                if ca < cc:
-                    heapq.heappush(heap, (-new_avg, ca, cc, new_size, cluster_size[cc]))
-                else:
-                    heapq.heappush(heap, (-new_avg, cc, ca, cluster_size[cc], new_size))
-
-        # Clean up the merged pair's sim_sums entry
-        sim_sums.pop((ca, cb) if ca < cb else (cb, ca), None)
-
-        cluster_members[ca].extend(cluster_members.pop(cb))
-        cluster_size[ca] = new_size
-        del cluster_size[cb]
-
-    # Convert to output format, filtering by min size
     clusters: list[list[GeneralizationItem]] = []
     assigned: set[int] = set()
-    for members in cluster_members.values():
-        if len(members) >= min_cluster_size:
-            cluster = [items[valid_indices[i]] for i in members]
-            clusters.append(cluster)
-            assigned.update(valid_indices[i] for i in members)
+    for members in _cluster_matrix(embeddings, similarity_threshold, scratch_dir):
+        if len(members) < min_cluster_size:
+            continue
+        global_members = [valid_indices[m] for m in members]
+        clusters.append([items[i] for i in global_members])
+        assigned.update(global_members)
 
     logfire.info(
         "Clustering complete",
@@ -510,7 +585,7 @@ Analyze this cluster of related generalizations. Assess coherence, identify the 
 
 **Important**: This cluster spans {len(unique_prs)} unique PR(s). Prefer the most general rule that still has multi-PR support. If distinct sub-patterns exist, extract multiple rules.
 """
-    result = await get_agent().run(prompt)
+    result = await run_agent_with_retry(get_agent(), prompt)
     return result.output, get_result_cost(result)
 
 
@@ -863,7 +938,10 @@ async def _async_run(
         # Phase 2: Clustering
         progress.update(task, description="Clustering...", completed=0, total=len(items))
         clusters = cluster_generalizations(
-            items, similarity_threshold=similarity_threshold, min_cluster_size=min_cluster_size
+            items,
+            similarity_threshold=similarity_threshold,
+            min_cluster_size=min_cluster_size,
+            scratch_dir=output_dir,
         )
         progress.update(task, completed=len(items))
         stats.set("clusters", len(clusters))
@@ -872,7 +950,8 @@ async def _async_run(
         unclustered = len(items) - total_clustered
         stats.set("unclustered", unclustered)
 
-        unclustered_items = [item for item in items if not any(item in c for c in clusters)]
+        clustered_ids = {id(item) for cluster in clusters for item in cluster}
+        unclustered_items = [item for item in items if id(item) not in clustered_ids]
         unclustered_path = output_dir / "unclustered.json"
         with open(unclustered_path, "w") as f:
             json.dump(

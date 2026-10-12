@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from rich.progress import Progress, TaskID
 
-from braindump.config import RepoConfig, compute_file_hash
+from braindump.config import RepoConfig, compute_file_hash, run_agent_with_retry
 from braindump.progress import StageStats, console, format_cost, get_result_cost, stage_progress
 
 # ============================================================================
@@ -238,7 +238,7 @@ Based on this evidence, determine the optimal placement for this rule.
 @logfire.instrument("place rule")
 async def place_rule(rule: dict, evidence: dict) -> tuple[RulePlacement, Decimal]:
     prompt = build_placement_prompt(rule, evidence)
-    result = await get_agent().run(prompt)
+    result = await run_agent_with_retry(get_agent(), prompt)
     return result.output, get_result_cost(result)
 
 

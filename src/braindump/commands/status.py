@@ -11,6 +11,7 @@ from typing import Any
 import typer
 from rich.table import Table
 
+from braindump.commands.download import RESOURCES, requested_resources
 from braindump.config import RepoConfig, compute_file_hash, compute_multi_file_hash
 from braindump.progress import console, format_cost, load_stage_cost
 
@@ -133,15 +134,13 @@ def _check_download(config: RepoConfig) -> tuple[str, str, str, str]:
     review_comments = _count_items_in_json_dir(config.pr_data_dir / "review_comments")
     diffs = _count_files(config.pr_data_dir / "diffs", "*.diff")
 
-    # Quick completeness check: compare file counts per subdirectory
+    # Quick completeness check: compare file counts for the resources that were requested
     output_dir = config.pr_data_dir
+    resources = requested_resources(output_dir)
     min_files = (
         min(
-            _count_files(output_dir / "prs", "*.json"),
-            _count_files(output_dir / "reviews", "*.json"),
-            _count_files(output_dir / "review_comments", "*.json"),
-            _count_files(output_dir / "diffs", "*.diff"),
-            _count_files(output_dir / "issue_comments", "*.json"),
+            _count_files(output_dir / RESOURCES[name][0], f"*.{RESOURCES[name][1]}")
+            for name in resources
         )
         if pr_count > 0
         else 0
@@ -156,7 +155,9 @@ def _check_download(config: RepoConfig) -> tuple[str, str, str, str]:
         )
         return PARTIAL, details, age, ""
 
-    details = f"{_fmt(pr_count)} PRs | {_fmt(review_comments)} review comments, {_fmt(diffs)} diffs"
+    details = f"{_fmt(pr_count)} PRs | {_fmt(review_comments)} review comments"
+    if "diffs" in resources:
+        details += f", {_fmt(diffs)} diffs"
     return DONE, details, age, ""
 
 

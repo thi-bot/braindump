@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from rich.progress import Progress, TaskID
 
-from braindump.config import RepoConfig, compute_file_hash
+from braindump.config import RepoConfig, compute_file_hash, run_agent_with_retry
 from braindump.progress import StageStats, console, format_cost, get_result_cost, stage_progress
 
 # ============================================================================
@@ -24,6 +24,9 @@ from braindump.progress import StageStats, console, format_cost, get_result_cost
 MIN_RULES_FOR_TOPICS = 10
 MIN_CLUSTER_SIZE = 10
 MIN_RULES_FOR_DIR_FILE = 3
+# Rules per topic-clustering call. A single call for a whole large location (root held 1,084 rules)
+# makes the model enumerate ids it silently truncates: 614 of those rules were dropped unmentioned.
+TOPIC_BATCH_SIZE = 120
 
 
 # ============================================================================
@@ -172,7 +175,7 @@ async def cluster_rules_by_topic(
             clusters=[], unclustered_rule_ids=[r["rule_id"] for r in rules_to_cluster]
         ), Decimal(0)
     prompt = build_clustering_prompt(rules_to_cluster)
-    result = await get_clustering_agent().run(prompt)
+    result = await run_agent_with_retry(get_clustering_agent(), prompt)
     output = result.output
     logfire.info(
         "Topic clustering result",
@@ -212,30 +215,56 @@ async def organize_location(
     valid_ids = {p["rule_id"] for p in valid_rules}
 
     if len(valid_rules) < MIN_RULES_FOR_TOPICS:
-        topic_clusters = []
-        unclustered_ids = [p["rule_id"] for p in valid_rules]
-        cost = Decimal(0)
-    else:
-        clustering_result, cost = await cluster_rules_by_topic(valid_rules)
-        topic_clusters = []
-        # Filter out hallucinated rule IDs from LLM output
-        unclustered_ids = [
-            rid for rid in clustering_result.unclustered_rule_ids if rid in valid_ids
-        ]
+        return (
+            OrganizedLocation(location=location, inline_rules=[p["rule_id"] for p in valid_rules]),
+            Decimal(0),
+        )
+
+    # One call per TOPIC_BATCH_SIZE rules, merged by topic_name so each topic still becomes one topic
+    # file. Batching keeps every call's id enumeration small enough that the model covers it.
+    topics: dict[str, TopicCluster] = {}
+    unclustered_ids: list[int] = []
+    cost = Decimal(0)
+    for start in range(0, len(valid_rules), TOPIC_BATCH_SIZE):
+        batch = valid_rules[start : start + TOPIC_BATCH_SIZE]
+        batch_ids = {p["rule_id"] for p in batch}
+        if len(batch) < MIN_CLUSTER_SIZE:
+            unclustered_ids.extend(p["rule_id"] for p in batch)
+            continue
+        clustering_result, batch_cost = await cluster_rules_by_topic(batch)
+        cost += batch_cost
+        unclustered_ids.extend(
+            rid for rid in clustering_result.unclustered_rule_ids if rid in batch_ids
+        )
         for cluster in clustering_result.clusters:
-            cluster.rule_ids = [rid for rid in cluster.rule_ids if rid in valid_ids]
-            if len(cluster.rule_ids) >= MIN_CLUSTER_SIZE:
-                topic_clusters.append(cluster)
-            else:
+            # Filter out hallucinated rule IDs from LLM output
+            cluster.rule_ids = [rid for rid in cluster.rule_ids if rid in batch_ids]
+            if len(cluster.rule_ids) < MIN_CLUSTER_SIZE:
                 unclustered_ids.extend(cluster.rule_ids)
+                continue
+            key = cluster.topic_name.strip().casefold()
+            if key in topics:
+                merged_ids = topics[key].rule_ids
+                merged_ids.extend(rid for rid in cluster.rule_ids if rid not in merged_ids)
+            else:
+                topics[key] = cluster
+
+    # Completeness repair: a rule the model neither clustered nor listed as unclustered stays inline
+    # instead of disappearing from the output.
+    covered = {rid for cluster in topics.values() for rid in cluster.rule_ids}
+    covered.update(unclustered_ids)
+    unclustered_ids.extend(sorted(valid_ids - covered))
 
     inline_rule_ids = list(dict.fromkeys(unclustered_ids))  # dedupe, preserve order
 
-    return OrganizedLocation(
-        location=location,
-        inline_rules=inline_rule_ids,
-        topic_references=topic_clusters,
-    ), cost
+    return (
+        OrganizedLocation(
+            location=location,
+            inline_rules=inline_rule_ids,
+            topic_references=list(topics.values()),
+        ),
+        cost,
+    )
 
 
 async def organize_all_rules(
@@ -471,10 +500,24 @@ async def _async_run(
 
         total_inline = 0
         total_topics = 0
+        by_location: dict[str, dict[str, int]] = {}
+        # File-level locations are numerous and small, so they are reported as one aggregate; the
+        # totals cover every location (skipping them here under-reported 405 of 2,303 rules).
+        file_level = {"locations": 0, "inline_rules": 0, "topic_clusters": 0, "topic_rules": 0}
         for org in organized:
-            if not org.location.startswith("file:"):
-                total_inline += len(org.inline_rules)
-                total_topics += sum(len(t.rule_ids) for t in org.topic_references)
+            entry = {
+                "inline_rules": len(org.inline_rules),
+                "topic_clusters": len(org.topic_references),
+                "topic_rules": sum(len(t.rule_ids) for t in org.topic_references),
+            }
+            total_inline += entry["inline_rules"]
+            total_topics += entry["topic_rules"]
+            if org.location.startswith("file:"):
+                file_level["locations"] += 1
+                for key in ("inline_rules", "topic_clusters", "topic_rules"):
+                    file_level[key] += entry[key]
+            else:
+                by_location[org.location] = entry
 
         stats.set("inline_rules", total_inline)
         stats.set("topic_rules", total_topics)
@@ -484,15 +527,9 @@ async def _async_run(
             "filtered_placements": len(placements),
             "min_score": min_score,
             "locations": len(organized),
-            "by_location": {},
+            "by_location": by_location,
+            "file_level": file_level,
         }
-        for org in organized:
-            if not org.location.startswith("file:"):
-                file_stats["by_location"][org.location] = {
-                    "inline_rules": len(org.inline_rules),
-                    "topic_clusters": len(org.topic_references),
-                    "topic_rules": sum(len(t.rule_ids) for t in org.topic_references),
-                }
         file_stats["totals"] = {"inline_rules": total_inline, "topic_rules": total_topics}
 
         output = Stage4Output(locations=organized, rules_by_id=rules_by_id, stats=file_stats)
